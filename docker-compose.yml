@@ -1,12 +1,54 @@
+# 迁网验收演示：docker compose up --build 后打开 http://localhost:8000/docs
+#
+# 默认服务 `lab` 在容器内用网络命名空间搭出一条真实的 IPv4 转发路径
+# （全部为 RFC 2544 / RFC 5737 保留地址，不触碰真实网络）：
+#
+#   probe(172.30.0.2) ── r1(172.30.0.1 / 10.1.0.1) ── r2(10.1.0.2 / 192.0.2.1)
+#                                                          └─ 192.0.2.0/24 目标网段
+#                                                             echo-a  .10  instance "echo-a"
+#                                                             echo-b  .11  instance "echo-b"
+#                                                             legacy  .12  旧端，原样回显
+#                                                             (void)  .99  无监听 → 端口不可达
+#
+# 需要在 Docker 中具备建网络命名空间的权限；若没有，容器仍会启动，
+# 但只有本地回显（127.0.0.1:9999）可用。纯应用镜像见 profile `plain`。
+name: telemetry-udp-probe
+
 services:
-  probe:
-    build: .
-    image: telemetry-udp-probe:latest
+  lab:
+    build:
+      context: .
+      target: lab
+    image: telemetry-udp-probe-lab:latest
+    init: true
+    cap_add:
+      - NET_ADMIN     # 建 veth / 路由 / 网桥
+      - SYS_ADMIN     # 建网络命名空间
     ports:
-      - "8000:8000"        # HTTP API / /docs
-      - "9999:9999/udp"    # 本地回显端（容器内探测默认走 127.0.0.1，此映射供宿主机手工验证）
+      - "8000:8000"   # HTTP API / /docs
+      - "9999:9999/udp"  # 本地回显端（/probe 默认目标）
     environment:
-      ECHO_HOST: 0.0.0.0        # 回显端监听地址
-      ECHO_PORT: "9999"         # 回显端 UDP 端口
-      PROBE_TARGET_HOST: 127.0.0.1  # 探测默认目标（容器内本地回显端）
+      ECHO_HOST: 0.0.0.0
+      ECHO_PORT: "9999"
+      PROBE_TARGET_HOST: 127.0.0.1
+      ECHO_ADVERTISE_HOST: 127.0.0.1
     restart: unless-stopped
+
+  # 纯应用镜像：不建演示拓扑，只提供本地回显与 /probe。/trace 可指向真实设备。
+  # 启动：docker compose --profile plain up --build
+  probe:
+    build:
+      context: .
+      target: app
+    image: telemetry-udp-probe:latest
+    init: true
+    environment:
+      ECHO_HOST: 0.0.0.0
+      ECHO_PORT: "9999"
+      PROBE_TARGET_HOST: 127.0.0.1
+      ECHO_ADVERTISE_HOST: 127.0.0.1
+    restart: unless-stopped
+    profiles: ["plain"]
+    ports:
+      - "8001:8000"
+      - "9998:9999/udp"

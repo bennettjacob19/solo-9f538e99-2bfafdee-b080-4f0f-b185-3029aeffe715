@@ -1,4 +1,4 @@
-"""socket 工具：设置 DF（Don't Fragment）位，禁止 IP 分片。"""
+"""socket 工具：DF（禁止 IP 分片）与逐跳探测用的 TTL。"""
 from __future__ import annotations
 
 import socket
@@ -6,6 +6,7 @@ import socket
 # Linux 常量兜底（某些 Python 构建未导出）
 IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
 IP_PMTUDISC_DO = getattr(socket, "IP_PMTUDISC_DO", 2)
+IP_TTL = getattr(socket, "IP_TTL", 2)
 
 
 def set_dont_fragment(sock) -> bool:  # noqa: ANN001, ANN201
@@ -23,4 +24,13 @@ def set_dont_fragment(sock) -> bool:  # noqa: ANN001, ANN201
         sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
         return True
     except (OSError, AttributeError):
+        return False
+
+
+def set_ttl(sock, ttl: int) -> bool:  # noqa: ANN001
+    """设置 IPv4 TTL；返回是否设置成功。"""
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, IP_TTL, int(ttl))
+        return True
+    except (OSError, AttributeError, ValueError):
         return False

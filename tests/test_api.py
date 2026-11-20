@@ -1,6 +1,7 @@
 """端到端测试：真实 UDP 回显端 + TestClient。"""
 from __future__ import annotations
 
+import socket
 import threading
 import time
 import uuid
@@ -70,7 +71,12 @@ class TestConfig:
         assert r.status_code == 200
         body = r.json()
         assert body["epoch"] == 0
-        assert body["config"] == {"mode": "normal", "drop_threshold": None}
+        assert body["config"] == {
+            "mode": "normal",
+            "drop_threshold": None,
+            "instance_name": "echo-a",
+            "trace_mode": "instance",
+        }
 
     def test_update_and_epoch_increments(self, client):
         e1 = set_config(client, mode="normal", drop_threshold=1000)
@@ -208,9 +214,171 @@ class TestProbe:
         assert client.post("/probe", json={"timeout_ms": 5}).status_code == 422
 
 
+class TestTraceApi:
+    def test_local_echo_match(self, client):
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 9999,
+                "expected_instance": "echo-a",
+                "max_hops": 4,
+                "hop_timeout_ms": 200,
+            },
+        ).json()
+        assert res["status"] == "reply"
+        assert res["instance_name"] == "echo-a"
+        assert res["instance_matched"] is True
+        assert res["reached"] is True
+        assert res["hops"][-1]["status"] == "reply"
+        # 固定源：一次诊断只用一个源端口
+        assert res["source"].startswith("127.0.0.1:")
+        assert client.get(f"/trace/{res['trace_id']}").json()["trace_id"] == res["trace_id"]
+        assert any(t["trace_id"] == res["trace_id"] for t in client.get("/traces").json())
+        assert client.get("/trace/nope").status_code == 404
+
+    def test_local_echo_mismatch(self, client):
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 9999,
+                "expected_instance": "echo-other",
+                "max_hops": 4,
+                "hop_timeout_ms": 200,
+            },
+        ).json()
+        assert res["status"] == "reply"
+        assert res["instance_name"] == "echo-a"
+        assert res["instance_matched"] is False
+        assert "不匹配" in res["reason"]
+
+    def test_legacy_echo_instance_unconfirmed(self, client):
+        set_config(client, trace_mode="legacy")
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 9999,
+                "expected_instance": "echo-a",
+                "max_hops": 4,
+                "hop_timeout_ms": 200,
+            },
+        ).json()
+        assert res["status"] == "instance_unconfirmed"
+        assert res["instance_name"] is None
+        assert res["instance_matched"] is None
+        assert "无法确认" in res["reason"]
+
+    def test_configured_instance_name_is_reported(self, client):
+        set_config(client, instance_name="echo-z")
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 9999,
+                "expected_instance": "echo-z",
+                "max_hops": 4,
+                "hop_timeout_ms": 200,
+            },
+        ).json()
+        assert res["instance_name"] == "echo-z"
+        assert res["instance_matched"] is True
+
+    def test_port_unreachable_reported(self, client):
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 59999,
+                "expected_instance": "echo-a",
+                "max_hops": 4,
+                "hop_timeout_ms": 200,
+            },
+        ).json()
+        assert res["status"] == "port_unreachable"
+        assert res["hops"][-1]["status"] == "port_unreachable"
+        assert res["instance_name"] is None
+
+    def test_trace_validation(self, client):
+        base = {"target_host": "127.0.0.1", "target_port": 9999}
+        for bad in (
+            {**base, "max_hops": 0},
+            {**base, "max_hops": 17},
+            {"target_host": "bad", "target_port": 9999},
+            {**base, "target_port": 70000},
+        ):
+            assert client.post("/trace", json=bad).status_code == 422, bad
+
+    def test_mtup_probe_still_echoes(self, client):
+        # 原 MTUP 探测行为保持不变
+        res = run_probe(client)
+        assert res["status"] == "ok" and res["max_confirmed_size"] == 1400
+
+
+class TestTraceSources:
+    def test_single_socket_fixed_source_for_all_hops(self, client, monkeypatch):
+        from app import traceroute
+
+        seen = []
+        real = traceroute.UdpTransport
+
+        class Recording(real):
+            def __init__(self, source_ip, source_port, target, target_port):
+                super().__init__(source_ip, source_port, target, target_port)
+                seen.append((self.source_ip, self.source_port))
+
+        monkeypatch.setattr(traceroute, "UdpTransport", Recording)
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 9999,
+                "expected_instance": "echo-a",
+                "max_hops": 3,
+                "hop_timeout_ms": 150,
+            },
+        ).json()
+        assert res["status"] == "reply"
+        assert len(seen) == 1  # 一次诊断只创建一个 socket
+        assert res["source"] == f"{seen[0][0]}:{seen[0][1]}"
+
+    def test_source_port_is_honored(self, client):
+        port = 45222
+        res = client.post(
+            "/trace",
+            json={
+                "target_host": "127.0.0.1",
+                "target_port": 9999,
+                "max_hops": 2,
+                "hop_timeout_ms": 150,
+                "source_port": port,
+            },
+        ).json()
+        assert res["source"].endswith(f":{port}")
+
+    def test_mtup_packet_still_raw_echoed(self, client):
+        import uuid
+
+        from app.packets import build_packet, parse_packet
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        try:
+            sid = uuid.uuid4()
+            payload = build_packet(sid, 9, 300)
+            sock.sendto(payload, ("127.0.0.1", 9999))
+            data, _ = sock.recvfrom(2048)
+        finally:
+            sock.close()
+        assert data == payload
+        assert parse_packet(data).seq == 9
+
+
 class TestDocs:
     def test_docs_and_openapi(self, client):
         assert client.get("/docs").status_code == 200
         spec = client.get("/openapi.json").json()
         assert "/echo/config" in spec["paths"]
         assert "/probe" in spec["paths"]
+        assert "/trace" in spec["paths"]
