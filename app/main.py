@@ -1,11 +1,14 @@
-"""FastAPI 入口：探测 API + 本地回显端配置。
+"""FastAPI 入口：最大负载探测 API + 迁网路由追踪 API + 本地回显端配置。
 
 - ``GET  /``                服务简介
 - ``GET  /echo/config``     查看回显端当前配置与 epoch
-- ``PUT  /echo/config``     设置丢弃阈值 / 断联（校验失败保留原状态）
-- ``POST /probe``           发起一次探测（默认范围 576~1400 字节）
+- ``PUT  /echo/config``     设置丢弃阈值 / 断联 / 实例名（校验失败保留原状态）
+- ``POST /probe``           发起一次最大负载探测（默认范围 576~1400 字节）
 - ``GET  /probe/{id}``      查询历史探测结论
 - ``GET  /probes``          历史探测结论列表
+- ``POST /trace``           发起一次迁网路由追踪（固定源、递增 TTL）
+- ``GET  /trace/{id}``      查询历史追踪结论
+- ``GET  /traces``          历史追踪结论列表
 
 交互式文档见 ``/docs``。
 """
@@ -23,12 +26,13 @@ from fastapi import FastAPI, HTTPException, Request
 from .echo_server import EchoConfig, EchoProtocol, EchoState
 from .netutil import set_dont_fragment
 from .prober import ProbeRequest, ProbeResult, Prober
+from .tracer import TraceRequest, TraceResult, Tracer
 
 ECHO_HOST = os.environ.get("ECHO_HOST", "0.0.0.0")
 ECHO_PORT = int(os.environ.get("ECHO_PORT", "9999"))
 PROBE_TARGET_HOST = os.environ.get("PROBE_TARGET_HOST", "127.0.0.1")
 
-MAX_RESULTS = 200  # 内存中保留的探测结论条数上限
+MAX_RESULTS = 200  # 内存中保留的结论条数上限
 
 
 @asynccontextmanager
@@ -51,7 +55,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.echo_state = state
     app.state.echo_protocol = echo_protocol
     app.state.prober = Prober(state, (PROBE_TARGET_HOST, ECHO_PORT))
+    app.state.tracer = Tracer()
     app.state.results = OrderedDict()  # probe_id -> ProbeResult
+    app.state.traces = OrderedDict()  # trace_id -> TraceResult
     try:
         yield
     finally:
@@ -59,14 +65,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="遥测网关 UDP 最大负载探测",
-    version="1.0.0",
+    title="遥测网关 UDP 探测与迁网路由追踪",
+    version="2.0.0",
     description=(
-        "小包能到回显端、大包却超时？用本服务确认遥测网关可用的最大 UDP 负载。\n\n"
+        "两组值班工具：\n\n"
+        "**1. UDP 最大负载探测**\n"
         "- 探测报文带 DF 位（禁止 IP 分片）与本次探测编号，只有对应回包才算成功；\n"
         "- 大包超时/发送失败先用小包复核，小包也失败则报告链路不确定；\n"
-        "- 探测期间改动回显端配置会使本次结论作废；\n"
-        "- 在下方 `PUT /echo/config` 设置丢弃阈值或断联，再 `POST /probe` 验证。"
+        "- 探测期间改动回显端配置会使本次结论作废。\n\n"
+        "**2. 迁网路由追踪（POST /trace）**\n"
+        "- 在请求中填目标 IPv4、UDP 端口、预期回显实例名、最大跳数（1~16）；\n"
+        "- 固定 UDP 源地址/端口，递增 TTL 发出带编号和序号的 MTTR 诊断包；\n"
+        "- 按跳返回 ICMP TTL 超时的路由器地址；等满 500ms 无可归属反馈标无应答并继续；\n"
+        "- ICMP 只引述完整 MTUP 头时也能归跳；迟到/无法对应的反馈不改判；\n"
+        "- 回显端用 MTRE 回包带回实例名，收到即停止并报告是否匹配；\n"
+        "- 旧端原样回包 → 实例无法确认；ICMP 端口不可达 → 单独报告并停止。"
     ),
     lifespan=lifespan,
 )
@@ -80,6 +93,7 @@ async def index() -> dict:
         "endpoints": {
             "config": ["GET /echo/config", "PUT /echo/config"],
             "probe": ["POST /probe", "GET /probes", "GET /probe/{probe_id}"],
+            "trace": ["POST /trace", "GET /traces", "GET /trace/{trace_id}"],
         },
     }
 
@@ -91,16 +105,23 @@ async def get_config(request: Request) -> dict:
     return {
         "epoch": state.epoch,
         "config": state.config,
-        "stats": {"echoed": proto.echoed, "dropped": proto.dropped},
+        "stats": {
+            "echoed": proto.echoed,
+            "trace_replied": proto.trace_replied,
+            "dropped": proto.dropped,
+        },
     }
 
 
-@app.put("/echo/config", summary="设置丢弃阈值或断联")
+@app.put("/echo/config", summary="设置丢弃阈值、断联或实例名")
 async def put_config(cfg: EchoConfig, request: Request) -> dict:
     # 入参先经 Pydantic 校验；校验失败直接 422，不会进入这里，原状态保持不变
     state: EchoState = request.app.state.echo_state
     epoch = state.apply(cfg)
     return {"epoch": epoch, "config": state.config}
+
+
+# ---------------------------------------------------------------- 最大负载探测
 
 
 @app.post("/probe", response_model=ProbeResult, summary="发起一次最大负载探测")
@@ -139,4 +160,55 @@ async def list_probes(request: Request) -> list[dict]:
             "finished_at": r.finished_at,
         }
         for r in reversed(list(results.values()))
+    ]
+
+
+# ---------------------------------------------------------------- 路由追踪
+
+
+@app.post("/trace", response_model=TraceResult, summary="发起一次迁网路由追踪")
+async def run_trace(req: TraceRequest, request: Request) -> TraceResult:
+    tracer: Tracer = request.app.state.tracer
+    try:
+        result = await tracer.trace(req)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ICMP 接收不可用且无 CAP_NET_RAW 权限创建 raw socket，"
+                f"无法归跳：{exc}"
+            ),
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无法发起追踪: {exc}") from exc
+    traces: OrderedDict[str, TraceResult] = request.app.state.traces
+    traces[result.trace_id] = result
+    while len(traces) > MAX_RESULTS:
+        traces.popitem(last=False)
+    return result
+
+
+@app.get("/trace/{trace_id}", response_model=TraceResult, summary="查询历史追踪结论")
+async def get_trace(trace_id: str, request: Request) -> TraceResult:
+    traces: OrderedDict[str, TraceResult] = request.app.state.traces
+    try:
+        return traces[trace_id]
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trace_id 不存在或已被淘汰") from None
+
+
+@app.get("/traces", summary="历史追踪结论列表")
+async def list_traces(request: Request) -> list[dict]:
+    traces: OrderedDict[str, TraceResult] = request.app.state.traces
+    return [
+        {
+            "trace_id": t.trace_id,
+            "status": t.status,
+            "target_ipv4": t.target_ipv4,
+            "target_port": t.target_port,
+            "instance_name": t.instance_name,
+            "matched": t.matched,
+            "finished_at": t.finished_at,
+        }
+        for t in reversed(list(traces.values()))
     ]

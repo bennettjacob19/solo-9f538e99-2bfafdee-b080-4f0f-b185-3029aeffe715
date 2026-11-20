@@ -1,12 +1,90 @@
+# 迁网验收演示拓扑：
+#
+#   probe (172.30.0.10) ── net-probe ── router(172.30.0.1)
+#                                              │ net-echo (10.1.0.0/24)
+#                            ┌─────────────────┼─────────────────┐
+#                     echo-a (10.1.0.11)                 echo-b (10.1.0.12)
+#
+# 探针发往 10.1.0.0/24 的包先经真实 Linux 路由器转发：
+# TTL=1 在路由器处超时（中间跳），TTL=2 到达回显实例（终跳 MTRE 应答）。
 services:
+  router:
+    build:
+      context: ./router
+    image: telemetry-demo-router:latest
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      net-probe:
+        ipv4_address: 172.30.0.1
+      net-echo:
+        ipv4_address: 10.1.0.1
+    restart: unless-stopped
+
   probe:
     build: .
     image: telemetry-udp-probe:latest
+    depends_on:
+      - router
+      - echo-a
+      - echo-b
+    cap_add:
+      - NET_ADMIN   # entrypoint 里安装经路由器的静态路由
+      - NET_RAW     # 可选：IP_RECVERR 不可用时回退 raw ICMP socket
     ports:
       - "8000:8000"        # HTTP API / /docs
-      - "9999:9999/udp"    # 本地回显端（容器内探测默认走 127.0.0.1，此映射供宿主机手工验证）
+      - "9999:9999/udp"    # 容器自带本地回显端（供宿主机手工验证）
     environment:
-      ECHO_HOST: 0.0.0.0        # 回显端监听地址
-      ECHO_PORT: "9999"         # 回显端 UDP 端口
-      PROBE_TARGET_HOST: 127.0.0.1  # 探测默认目标（容器内本地回显端）
+      ECHO_HOST: 0.0.0.0
+      ECHO_PORT: "9999"
+      ECHO_INSTANCE_NAME: echo-local
+      PROBE_TARGET_HOST: 127.0.0.1
+      ROUTER_IP: 172.30.0.1
+      ECHO_SUBNET: 10.1.0.0/24
+    networks:
+      net-probe:
+        ipv4_address: 172.30.0.10
     restart: unless-stopped
+
+  echo-a:
+    build: .
+    image: telemetry-udp-probe:latest
+    environment:
+      ECHO_HOST: 0.0.0.0
+      ECHO_PORT: "9999"
+      ECHO_INSTANCE_NAME: echo-instance-a
+      SKIP_ROUTE_SETUP: "1"
+    networks:
+      net-echo:
+        ipv4_address: 10.1.0.11
+    restart: unless-stopped
+
+  echo-b:
+    build: .
+    image: telemetry-udp-probe:latest
+    environment:
+      ECHO_HOST: 0.0.0.0
+      ECHO_PORT: "9999"
+      ECHO_INSTANCE_NAME: echo-instance-b
+      SKIP_ROUTE_SETUP: "1"
+    networks:
+      net-echo:
+        ipv4_address: 10.1.0.12
+    restart: unless-stopped
+
+networks:
+  net-probe:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/24
+  net-echo:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.1.0.0/24

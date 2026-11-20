@@ -70,7 +70,10 @@ class TestConfig:
         assert r.status_code == 200
         body = r.json()
         assert body["epoch"] == 0
-        assert body["config"] == {"mode": "normal", "drop_threshold": None}
+        assert body["config"]["mode"] == "normal"
+        assert body["config"]["drop_threshold"] is None
+        assert body["config"]["instance_name"]  # 非空实例名
+        assert "trace_replied" in body["stats"]
 
     def test_update_and_epoch_increments(self, client):
         e1 = set_config(client, mode="normal", drop_threshold=1000)
@@ -214,3 +217,5 @@ class TestDocs:
         spec = client.get("/openapi.json").json()
         assert "/echo/config" in spec["paths"]
         assert "/probe" in spec["paths"]
+        assert "/trace" in spec["paths"]
+        assert "/traces" in spec["paths"]
